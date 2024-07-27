@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  bitcoin-node:
+    image: ruimarinho/bitcoin-core:alpine
+    container_name: bitcoin-node
+    volumes:
+      - bitcoin-data:/bitcoin/.bitcoin
+    ports:
+      - "8333:8333"
+    environment:
+      BITCOIN_NETWORK: mainnet
+
+volumes:
+  bitcoin-data:
