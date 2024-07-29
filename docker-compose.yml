@@ -5,7 +5,7 @@ services:
     image: ruimarinho/bitcoin-core:alpine
     container_name: bitcoin-node
     volumes:
-      - ./bitcoin-data:/bitcoin/.bitcoin
+      - ./bitcoin-data:/home/bitcoin/.bitcoin
     ports:
       - "8333:8333"
     environment:

@@ -23,6 +23,9 @@ Run the following command to start the Bitcoin node:
 docker-compose up
 ```
 
+**Important:** Wait for the Bitcoin node to start fully before launching the handshake project.
+
+
 ### Running the Project
 
 To build and run the project, use the provided `Makefile`. The `Makefile` includes commands for building, running, and testing the project.
@@ -84,3 +87,6 @@ This setup allows the project to connect to a local Bitcoin node running on `127
 ## Conclusion
 
 This project demonstrates a basic handshake with a Bitcoin node using Go. It includes reading and sending messages using goroutines, managing the connection lifecycle, and validating messages according to the Bitcoin P2P protocol.
+
+
+
