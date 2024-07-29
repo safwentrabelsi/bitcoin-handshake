@@ -1,4 +1,4 @@
-BUILD_FOLDER  ?= build
+BUILD_FOLDER  ?= bin
 BINARY_NAME   ?= bitcoin-handshake
 
 .PHONY: build

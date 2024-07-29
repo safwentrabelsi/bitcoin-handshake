@@ -2,17 +2,17 @@ package network
 
 import (
 	"bytes"
-	"crypto/sha256"
+	"context"
 	"encoding/binary"
 	"fmt"
-	"net"
 	"strings"
-	"time"
 
 	"github.com/safwentrabelsi/bitcoin-handshake/config"
 	"github.com/safwentrabelsi/bitcoin-handshake/netaddr"
+	"github.com/safwentrabelsi/bitcoin-handshake/utils"
 	"github.com/safwentrabelsi/bitcoin-handshake/version"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 )
 
 const headerLength = 24
@@ -21,23 +21,37 @@ type Message struct {
 	Command string
 	Payload []byte
 }
+type Conn interface {
+	Read(b []byte) (n int, err error)
+	Write(b []byte) (n int, err error)
+	Close() error
+}
 
-func ConnectAndHandshake(address string) {
+func ConnectAndHandshake(conn Conn) {
+	defer conn.Close()
+
 	sendChannel := make(chan Message)
 	receiveChannel := make(chan []byte)
-	doneChannel := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	conn, err := net.DialTimeout("tcp", address, 10*time.Second)
-	if err != nil {
-		log.Fatalf("Failed to connect: %v", err)
-	}
-	defer conn.Close()
+	var g errgroup.Group
 
 	verackSent := false
 	verackReceived := false
 
-	go readMessages(conn, receiveChannel, doneChannel)
-	go sendMessages(conn, sendChannel, &verackSent, doneChannel)
+	g.Go(func() error {
+		return readMessages(ctx, conn, receiveChannel)
+	})
+
+	g.Go(func() error {
+		return sendMessages(ctx, conn, sendChannel, &verackSent)
+	})
+
+	errgroupDone := make(chan error, 1)
+	go func() {
+		errgroupDone <- g.Wait()
+	}()
 
 	// Send initial version message
 	sendChannel <- Message{Command: "version", Payload: createVersionPayload()}
@@ -45,36 +59,41 @@ func ConnectAndHandshake(address string) {
 	for {
 		select {
 		case data := <-receiveChannel:
-			err := parseMessage(data, sendChannel, &verackReceived, doneChannel)
+			err := parseMessage(data, sendChannel, &verackReceived)
 			if err != nil {
 				log.Errorf("Failed to parse message: %v", err)
+				cancel()
 				return
 			}
 			if verackSent && verackReceived {
 				log.Info("Handshake completed successfully. Closing connection.")
-				close(doneChannel)
+				cancel()
 				return
 			}
-		case <-doneChannel:
+		case <-ctx.Done():
 			return
+		case err := <-errgroupDone:
+			if err != nil {
+				log.Errorf("Goroutine error: %v", err)
+				cancel()
+				return
+			}
 		}
 	}
 }
-
-func readMessages(conn net.Conn, receiveChannel chan<- []byte, doneChannel <-chan struct{}) {
+func readMessages(ctx context.Context, conn Conn, receiveChannel chan<- []byte) error {
+	defer close(receiveChannel)
 	for {
 		select {
-		case <-doneChannel:
-			close(receiveChannel)
-			return
+		case <-ctx.Done():
+			return ctx.Err()
 		default:
 			// Read the header
 			header := make([]byte, headerLength)
 			_, err := conn.Read(header)
 			if err != nil {
 				log.Errorf("Failed to read header from connection: %v", err)
-				close(receiveChannel)
-				return
+				return err
 			}
 
 			// Parse the length from the header
@@ -82,8 +101,7 @@ func readMessages(conn net.Conn, receiveChannel chan<- []byte, doneChannel <-cha
 			headerReader := bytes.NewReader(header[16:20])
 			if err := binary.Read(headerReader, binary.LittleEndian, &length); err != nil {
 				log.Errorf("Failed to parse length from header: %v", err)
-				close(receiveChannel)
-				return
+				return err
 			}
 
 			// Read the payload based on the length
@@ -91,8 +109,7 @@ func readMessages(conn net.Conn, receiveChannel chan<- []byte, doneChannel <-cha
 			_, err = conn.Read(payload)
 			if err != nil {
 				log.Errorf("Failed to read payload from connection: %v", err)
-				close(receiveChannel)
-				return
+				return err
 			}
 
 			// Send the complete message (header + payload) to the receiveChannel
@@ -102,34 +119,36 @@ func readMessages(conn net.Conn, receiveChannel chan<- []byte, doneChannel <-cha
 	}
 }
 
-func sendMessages(conn net.Conn, sendChannel <-chan Message, verackSent *bool, doneChannel <-chan struct{}) {
+func sendMessages(ctx context.Context, conn Conn, sendChannel chan Message, verackSent *bool) error {
+	defer close(sendChannel)
+
 	for {
 		select {
 		case msg := <-sendChannel:
 			var buf bytes.Buffer
 			if err := writeMessageHeader(&buf, msg.Command, msg.Payload); err != nil {
 				log.Errorf("Failed to write message header: %v", err)
-				continue
+				return err
 			}
 			if _, err := buf.Write(msg.Payload); err != nil {
 				log.Errorf("Failed to write message payload: %v", err)
-				continue
+				return err
 			}
 			if _, err := conn.Write(buf.Bytes()); err != nil {
 				log.Errorf("Failed to send message: %v", err)
-				continue
+				return err
 			}
 			log.Infof("Sent %s message", msg.Command)
 			if msg.Command == "verack" {
 				*verackSent = true
 			}
-		case <-doneChannel:
-			return
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 }
 
-func parseMessage(data []byte, sendChannel chan<- Message, verackReceived *bool, doneChannel chan<- struct{}) error {
+func parseMessage(data []byte, sendChannel chan<- Message, verackReceived *bool) error {
 	if len(data) < headerLength {
 		return fmt.Errorf("data too short: expected at least %d bytes, got %d", headerLength, len(data))
 	}
@@ -160,7 +179,7 @@ func parseMessage(data []byte, sendChannel chan<- Message, verackReceived *bool,
 		return fmt.Errorf("invalid magic bytes: expected %x, got %x", expectedMagic, magic)
 	}
 
-	calculatedChecksum := calculateChecksum(payload[:length])
+	calculatedChecksum := utils.CalculateChecksum(payload[:length])
 	if checksum != calculatedChecksum {
 		return fmt.Errorf("invalid checksum: expected %x, got %x", checksum, calculatedChecksum)
 	}
@@ -183,7 +202,6 @@ func parseMessage(data []byte, sendChannel chan<- Message, verackReceived *bool,
 	default:
 		if !*verackReceived {
 			log.Errorf("Received unknown command: %s. Closing connection.", trimmedCommand)
-			close(doneChannel)
 			return fmt.Errorf("unknown command received: %s", trimmedCommand)
 		}
 
@@ -255,14 +273,6 @@ func parseVersionPayload(payload []byte) error {
 	return nil
 }
 
-func calculateChecksum(payload []byte) [4]byte {
-	firstHash := sha256.Sum256(payload)
-	secondHash := sha256.Sum256(firstHash[:])
-	var checksum [4]byte
-	copy(checksum[:], secondHash[:4])
-	return checksum
-}
-
 func createVersionPayload() []byte {
 	payload, err := version.MakeVersionPayload()
 	if err != nil {
@@ -286,7 +296,7 @@ func writeMessageHeader(buf *bytes.Buffer, command string, payload []byte) error
 		return err
 	}
 
-	checksum := calculateChecksum(payload)
+	checksum := utils.CalculateChecksum(payload)
 	if _, err := buf.Write(checksum[:]); err != nil {
 		return err
 	}

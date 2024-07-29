@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"time"
 
 	"github.com/safwentrabelsi/bitcoin-handshake/config"
 	"github.com/safwentrabelsi/bitcoin-handshake/network"
@@ -17,6 +18,12 @@ func main() {
 
 	log.SetLevel(logrus.DebugLevel)
 
-	network.ConnectAndHandshake(net.JoinHostPort(config.BTCNodeHost, fmt.Sprint(config.BTCNodePort)))
+	address := net.JoinHostPort(config.BTCNodeHost, fmt.Sprint(config.BTCNodePort))
+	conn, err := net.DialTimeout("tcp", address, 10*time.Second)
+	if err != nil {
+		log.Fatalf("Failed to connect: %v", err)
+	}
+	defer conn.Close()
 
+	network.ConnectAndHandshake(conn)
 }
